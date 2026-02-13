@@ -3,51 +3,30 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { getVercelOidcToken } from "@vercel/oidc";
 
-// Helper: exige env
 function mustEnv(name) {
   const v = process.env[name];
   if (!v || String(v).trim() === "") throw new Error(`${name} missing`);
   return v;
 }
 
-// Helper: toma env con fallback
-function env(name, fallbackName = null) {
-  const v = process.env[name];
-  if (v && String(v).trim() !== "") return String(v).trim();
-  if (fallbackName) {
-    const f = process.env[fallbackName];
-    if (f && String(f).trim() !== "") return String(f).trim();
-  }
-  return "";
-}
+// 1) Vercel OIDC -> Google STS access_token (Workload Identity Federation)
+async function getGoogleAccessTokenFromVercelOIDC() {
+  const projectNumber = mustEnv("GCP_PROJECT_NUMBER");
+  const poolId = mustEnv("GCP_WIF_POOL_ID");
+  const providerId = mustEnv("GCP_WIF_PROVIDER_ID");
 
-// 1) Vercel OIDC -> Google STS access_token
-async function getGoogleAccessTokenFromVercelOIDC({ projectNumber, poolId, providerId, debug }) {
   const audience = `//iam.googleapis.com/projects/${projectNumber}/locations/global/workloadIdentityPools/${poolId}/providers/${providerId}`;
 
-  // Token OIDC emitido por Vercel
   const vercelOidc = await getVercelOidcToken();
-
-  // Solo para debug: ver issuer/aud (sin exponer token completo)
-  let oidcPayload = null;
-  try {
-    const parts = String(vercelOidc).split(".");
-    if (parts.length >= 2) {
-      const json = Buffer.from(parts[1], "base64").toString("utf8");
-      oidcPayload = JSON.parse(json);
-    }
-  } catch {
-    oidcPayload = null;
-  }
 
   const stsUrl = "https://sts.googleapis.com/v1/token";
 
+  // ✅ JSON consistente. OIDC token => subjectTokenType = id_token
   const body = {
     audience,
     grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
     requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
     scope: "https://www.googleapis.com/auth/cloud-platform",
-    // Para Vercel OIDC, esto debe ser id_token
     subjectTokenType: "urn:ietf:params:oauth:token-type:id_token",
     subjectToken: vercelOidc,
   };
@@ -61,40 +40,19 @@ async function getGoogleAccessTokenFromVercelOIDC({ projectNumber, poolId, provi
   const data = await r.json().catch(() => null);
 
   if (!r.ok || !data?.access_token) {
-    return {
-      ok: false,
-      where: "sts",
-      status: r.status,
-      data,
-      debug: debug
-        ? {
-            audience,
-            oidc_issuer: oidcPayload?.iss,
-            oidc_aud: oidcPayload?.aud,
-            oidc_sub: oidcPayload?.sub,
-          }
-        : undefined,
-    };
+    return { ok: false, status: r.status, data };
   }
 
-  return {
-    ok: true,
-    accessToken: data.access_token,
-    debug: debug
-      ? {
-          audience,
-          oidc_issuer: oidcPayload?.iss,
-          oidc_aud: oidcPayload?.aud,
-          oidc_sub: oidcPayload?.sub,
-        }
-      : undefined,
-  };
+  return { ok: true, accessToken: data.access_token };
 }
 
-// 2) access_token -> generateIdToken del Service Account (IAMCredentials)
-async function generateIdTokenForCloudRun(accessToken, serviceAccountEmail, audienceUrl) {
-  const url =
-    `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(serviceAccountEmail)}:generateIdToken`;
+// 2) access_token -> generar ID token del Service Account para invocar Cloud Run privado
+async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
+  const serviceAccount = mustEnv("GCP_SERVICE_ACCOUNT"); // email del SA
+
+  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(
+    serviceAccount
+  )}:generateIdToken`;
 
   const r = await fetch(url, {
     method: "POST",
@@ -111,7 +69,7 @@ async function generateIdTokenForCloudRun(accessToken, serviceAccountEmail, audi
   const data = await r.json().catch(() => null);
 
   if (!r.ok || !data?.token) {
-    return { ok: false, where: "generateIdToken", status: r.status, data };
+    return { ok: false, status: r.status, data };
   }
 
   return { ok: true, idToken: data.token };
@@ -119,96 +77,57 @@ async function generateIdTokenForCloudRun(accessToken, serviceAccountEmail, audi
 
 export async function POST(req) {
   try {
+    const ADMIN_KEY = mustEnv("ADMIN_KEY");
+
+    const targetUrl = mustEnv("GCP_TARGET_URL"); // https://createmppreference-...run.app
+    const audience = mustEnv("GCP_AUDIENCE"); // normalmente IGUAL a targetUrl
+
     const body = await req.json().catch(() => null);
-    if (!body) {
-      return NextResponse.json({ ok: false, error: "invalid_json" }, { status: 400 });
-    }
+    if (!body) return NextResponse.json({ ok: false, error: "invalid_json" }, { status: 400 });
 
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
 
-    if (!name) return NextResponse.json({ ok: false, error: "missing name" }, { status: 400 });
-    if (!email || !email.includes("@")) {
-      return NextResponse.json({ ok: false, error: "missing email" }, { status: 400 });
+    if (!name) return NextResponse.json({ ok: false, error: "missing_name" }, { status: 400 });
+    if (!email || !email.includes("@"))
+      return NextResponse.json({ ok: false, error: "missing_email" }, { status: 400 });
+
+    // ✅ Precio real fijo (producción)
+    let amount = 100000;
+
+    // ✅ TEST MODE ultra-seguro: SOLO si debug=true + x-admin-key correcta + email permitido
+    const debug = body.debug === true;
+    const adminHeader = String(req.headers.get("x-admin-key") || "");
+    const allowedTestEmails = new Set([
+      "estudiojuridico@merdini-ibire.com.ar",
+      // si querés agregar otro tuyo, lo sumás acá:
+      // "nico@tudominio.com.ar",
+    ]);
+
+    if (debug) {
+      if (adminHeader !== ADMIN_KEY) {
+        return NextResponse.json({ ok: false, error: "debug_not_allowed" }, { status: 403 });
+      }
+      if (!allowedTestEmails.has(email)) {
+        return NextResponse.json({ ok: false, error: "debug_email_not_allowed" }, { status: 403 });
+      }
+      // ✅ monto test (por defecto 1). Permitimos override para que elijas 10/100/etc.
+      const wanted = Number(body.testAmount ?? 1);
+      amount = Number.isFinite(wanted) && wanted > 0 ? wanted : 1;
     }
 
-    const amount = 100000;
     const consultaId = `web_${Date.now()}`;
 
-    // 🔎 Debug mode (si mandás {"debug":true} en el body)
-    const debug = Boolean(body.debug);
-
-    // ENVs (sin secretos)
-    const projectNumber = env("GCP_PROJECT_NUMBER");
-    const poolId = env("GCP_WIF_POOL_ID", "GCP_WORKLOAD_IDENTITY_POOL_ID");
-    const providerId = env("GCP_WIF_PROVIDER_ID", "GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID");
-    const serviceAccount = env("GCP_SERVICE_ACCOUNT", "GCP_SERVICE_ACCOUNT_EMAIL"); // 👈 clave: fallback
-    const targetUrl = env("GCP_TARGET_URL", "MP_PREF_URL");
-    const audienceUrl = env("GCP_AUDIENCE", "GCP_TARGET_URL") || targetUrl;
-
-    // ADMIN KEY sí es secreta, pero solo validamos existencia
-    const adminKey = env("ADMIN_KEY");
-    if (!adminKey) throw new Error("ADMIN_KEY missing");
-
-    // Validaciones de env mínimas
-    if (!projectNumber) throw new Error("GCP_PROJECT_NUMBER missing");
-    if (!poolId) throw new Error("GCP_WIF_POOL_ID missing");
-    if (!providerId) throw new Error("GCP_WIF_PROVIDER_ID missing");
-    if (!serviceAccount) throw new Error("GCP_SERVICE_ACCOUNT missing");
-    if (!targetUrl) throw new Error("GCP_TARGET_URL missing");
-
     // 1) STS
-    const sts = await getGoogleAccessTokenFromVercelOIDC({
-      projectNumber,
-      poolId,
-      providerId,
-      debug,
-    });
-
+    const sts = await getGoogleAccessTokenFromVercelOIDC();
     if (!sts.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "sts_exchange_failed",
-          details: sts,
-          env: debug
-            ? {
-                projectNumber,
-                poolId,
-                providerId,
-                serviceAccount,
-                targetUrl,
-                audienceUrl,
-                hasAdminKey: Boolean(adminKey),
-              }
-            : undefined,
-        },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "sts_exchange_failed", details: sts }, { status: 500 });
     }
 
-    // 2) generateIdToken
-    const idt = await generateIdTokenForCloudRun(sts.accessToken, serviceAccount, audienceUrl);
+    // 2) ID token
+    const idt = await generateIdTokenForCloudRun(sts.accessToken, audience);
     if (!idt.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "generate_id_token_failed",
-          details: idt,
-          env: debug
-            ? {
-                projectNumber,
-                poolId,
-                providerId,
-                serviceAccount,
-                targetUrl,
-                audienceUrl,
-              }
-            : undefined,
-          stsDebug: debug ? sts.debug : undefined,
-        },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "generate_id_token_failed", details: idt }, { status: 500 });
     }
 
     // 3) Call Cloud Run
@@ -217,7 +136,7 @@ export async function POST(req) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${idt.idToken}`,
-        "x-admin-key": adminKey,
+        "x-admin-key": ADMIN_KEY,
       },
       body: JSON.stringify({
         consultaId,
@@ -249,15 +168,12 @@ export async function POST(req) {
       preferenceId: data.preferenceId,
       init_point: data.init_point,
       sandbox_init_point: data.sandbox_init_point,
+      amount_used: amount, // útil para ver si fue test o real
+      debug_used: debug,
     });
   } catch (e) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "server_error",
-        message: e?.message || "unknown",
-        stack: e?.stack,
-      },
+      { ok: false, error: "server_error", message: e?.message || "unknown" },
       { status: 500 }
     );
   }
