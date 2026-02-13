@@ -5,37 +5,41 @@ import { getVercelOidcToken } from "@vercel/oidc";
 
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v || String(v).trim() === "") throw new Error(`${name} missing`);
+  if (!v || String(v).trim() === "") {
+    throw new Error(`${name} missing`);
+  }
   return v;
 }
 
-// Intercambia Vercel OIDC -> Google STS access_token (Workload Identity Federation)
+/**
+ * 1) Vercel OIDC -> Google STS access_token
+ */
 async function getGoogleAccessTokenFromVercelOIDC() {
   const projectNumber = mustEnv("GCP_PROJECT_NUMBER");
   const poolId = mustEnv("GCP_WIF_POOL_ID");
   const providerId = mustEnv("GCP_WIF_PROVIDER_ID");
 
-  // Audience para STS (SIEMPRE este formato)
   const audience = `//iam.googleapis.com/projects/${projectNumber}/locations/global/workloadIdentityPools/${poolId}/providers/${providerId}`;
 
-  // Token OIDC emitido por Vercel
   const vercelOidc = await getVercelOidcToken();
 
   const stsUrl = "https://sts.googleapis.com/v1/token";
 
-  const body = {
+  const params = new URLSearchParams({
     audience,
-    grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
-    requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+    requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
     scope: "https://www.googleapis.com/auth/cloud-platform",
-    subjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
-    subjectToken: vercelOidc,
-  };
+    subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+    subject_token: vercelOidc,
+  });
 
   const r = await fetch(stsUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
   });
 
   const data = await r.json().catch(() => null);
@@ -47,11 +51,12 @@ async function getGoogleAccessTokenFromVercelOIDC() {
   return { ok: true, accessToken: data.access_token };
 }
 
-// Con access_token -> generar ID token del Service Account para invocar Cloud Run privado
+/**
+ * 2) access_token -> ID Token del Service Account (Cloud Run privado)
+ */
 async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
   const serviceAccount = mustEnv("GCP_SERVICE_ACCOUNT");
 
-  // Endpoint IAMCredentials
   const url =
     `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(serviceAccount)}:generateIdToken`;
 
@@ -76,30 +81,44 @@ async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
   return { ok: true, idToken: data.token };
 }
 
+/**
+ * ENDPOINT PRINCIPAL
+ */
 export async function POST(req) {
   try {
     const ADMIN_KEY = mustEnv("ADMIN_KEY");
-
-    // Target Cloud Run (tu createmppreference)
-    const targetUrl = mustEnv("GCP_TARGET_URL");   // ej: https://createmppreference-...run.app
-    const audience = mustEnv("GCP_AUDIENCE");      // normalmente IGUAL al targetUrl
+    const targetUrl = mustEnv("GCP_TARGET_URL");
+    const audience = mustEnv("GCP_AUDIENCE");
 
     const body = await req.json().catch(() => null);
-    if (!body) return NextResponse.json({ ok: false, error: "invalid_json" }, { status: 400 });
+    if (!body) {
+      return NextResponse.json(
+        { ok: false, error: "invalid_json" },
+        { status: 400 }
+      );
+    }
 
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
+    const amount = 100000;
 
-    const amount = 100000; // precio fijo
+    if (!name) {
+      return NextResponse.json(
+        { ok: false, error: "missing name" },
+        { status: 400 }
+      );
+    }
 
-    if (!name) return NextResponse.json({ ok: false, error: "missing name" }, { status: 400 });
     if (!email || !email.includes("@")) {
-      return NextResponse.json({ ok: false, error: "missing email" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "missing email" },
+        { status: 400 }
+      );
     }
 
     const consultaId = `web_${Date.now()}`;
 
-    // 1) Vercel OIDC -> Google access token
+    // 1) STS
     const sts = await getGoogleAccessTokenFromVercelOIDC();
     if (!sts.ok) {
       return NextResponse.json(
@@ -108,7 +127,7 @@ export async function POST(req) {
       );
     }
 
-    // 2) access token -> ID token para Cloud Run
+    // 2) ID Token
     const idt = await generateIdTokenForCloudRun(sts.accessToken, audience);
     if (!idt.ok) {
       return NextResponse.json(
@@ -136,11 +155,21 @@ export async function POST(req) {
 
     const raw = await r.text();
     let data = null;
-    try { data = JSON.parse(raw); } catch { data = null; }
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = null;
+    }
 
     if (!r.ok || !data?.ok) {
       return NextResponse.json(
-        { ok: false, error: "cloud_run_error", status: r.status, statusText: r.statusText, raw },
+        {
+          ok: false,
+          error: "cloud_run_error",
+          status: r.status,
+          statusText: r.statusText,
+          raw,
+        },
         { status: 500 }
       );
     }
@@ -155,7 +184,11 @@ export async function POST(req) {
 
   } catch (e) {
     return NextResponse.json(
-      { ok: false, error: "server_error", message: e?.message || "unknown" },
+      {
+        ok: false,
+        error: "server_error",
+        message: e?.message || "unknown",
+      },
       { status: 500 }
     );
   }
