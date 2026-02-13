@@ -2,88 +2,55 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { getVercelOidcToken } from "@vercel/oidc";
+import { ExternalAccountClient, Impersonated } from "google-auth-library";
 
 function mustEnv(name) {
   const v = process.env[name];
   if (!v || String(v).trim() === "") throw new Error(`${name} missing`);
-  return v;
+  return String(v).trim();
 }
 
-// 1) Vercel OIDC -> Google STS access_token (Workload Identity Federation)
-async function getGoogleAccessTokenFromVercelOIDC() {
+// 1) Vercel OIDC -> Google WIF (ExternalAccountClient) -> Impersonated -> ID Token para Cloud Run
+async function getCloudRunIdToken(targetAudienceUrl) {
   const projectNumber = mustEnv("GCP_PROJECT_NUMBER");
   const poolId = mustEnv("GCP_WIF_POOL_ID");
   const providerId = mustEnv("GCP_WIF_PROVIDER_ID");
+  const serviceAccount = mustEnv("GCP_SERVICE_ACCOUNT"); // email del SA
 
-  // Audience STS (formato correcto)
   const audience = `//iam.googleapis.com/projects/${projectNumber}/locations/global/workloadIdentityPools/${poolId}/providers/${providerId}`;
 
-  // Token OIDC emitido por Vercel
-  const vercelOidc = await getVercelOidcToken();
-
-  const stsUrl = "https://sts.googleapis.com/v1/token";
-
-  // ✅ IMPORTANTE: subject_token_type = jwt (así lo usa Google para WIF)
-  // y body x-www-form-urlencoded (lo más compatible)
-  const params = new URLSearchParams({
+  // Cliente externo (WIF) que usa el token OIDC de Vercel como subject token
+  const externalClient = ExternalAccountClient.fromJSON({
+    type: "external_account",
     audience,
-    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-    requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
-    scope: "https://www.googleapis.com/auth/cloud-platform",
     subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
-    subject_token: vercelOidc,
-  });
-
-  const r = await fetch(stsUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
-  });
-
-  const data = await r.json().catch(() => null);
-
-  if (!r.ok || !data?.access_token) {
-    return { ok: false, status: r.status, data };
-  }
-
-  return { ok: true, accessToken: data.access_token };
-}
-
-// 2) access_token -> ID Token del Service Account para invocar Cloud Run privado
-async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
-  const serviceAccount = mustEnv("GCP_SERVICE_ACCOUNT");
-
-  const url =
-    `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(serviceAccount)}:generateIdToken`;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
+    token_url: "https://sts.googleapis.com/v1/token",
+    service_account_impersonation_url: `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${serviceAccount}:generateAccessToken`,
+    subject_token_supplier: {
+      // Vercel provee el OIDC token en runtime (x-vercel-oidc-token)
+      getSubjectToken: getVercelOidcToken,
     },
-    body: JSON.stringify({
-      audience: audienceUrl,
-      includeEmail: true,
-    }),
   });
 
-  const data = await r.json().catch(() => null);
+  // Impersonación del service account para poder pedir ID token (Cloud Run)
+  const impersonated = new Impersonated({
+    sourceClient: externalClient,
+    targetPrincipal: serviceAccount,
+    lifetime: 300, // segundos
+    delegates: [],
+    targetScopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
 
-  if (!r.ok || !data?.token) {
-    return { ok: false, status: r.status, data };
-  }
-
-  return { ok: true, idToken: data.token };
+  const idToken = await impersonated.fetchIdToken(targetAudienceUrl);
+  if (!idToken) throw new Error("Failed to fetch ID token");
+  return idToken;
 }
 
 export async function POST(req) {
   try {
     const ADMIN_KEY = mustEnv("ADMIN_KEY");
-
-    // Cloud Run target (createmppreference)
-    const targetUrl = mustEnv("GCP_TARGET_URL"); // ej: https://createmppreference-...run.app
-    const audienceUrl = mustEnv("GCP_AUDIENCE"); // normalmente IGUAL a targetUrl
+    const targetUrl = mustEnv("GCP_TARGET_URL"); // ej: https://createmppreference-....run.app
+    const audienceUrl = mustEnv("GCP_AUDIENCE"); // normalmente igual al targetUrl
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -93,39 +60,24 @@ export async function POST(req) {
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
 
-    const amount = 100000;
+    const amount = 100000; // precio fijo
 
-    if (!name) return NextResponse.json({ ok: false, error: "missing name" }, { status: 400 });
+    if (!name) return NextResponse.json({ ok: false, error: "missing_name" }, { status: 400 });
     if (!email || !email.includes("@")) {
-      return NextResponse.json({ ok: false, error: "missing email" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "missing_email" }, { status: 400 });
     }
 
     const consultaId = `web_${Date.now()}`;
 
-    // 1) STS exchange
-    const sts = await getGoogleAccessTokenFromVercelOIDC();
-    if (!sts.ok) {
-      return NextResponse.json(
-        { ok: false, error: "sts_exchange_failed", details: sts },
-        { status: 500 }
-      );
-    }
+    // 1) Conseguir ID token para Cloud Run privado usando WIF (Vercel OIDC)
+    const idToken = await getCloudRunIdToken(audienceUrl);
 
-    // 2) Generate ID token as Service Account
-    const idt = await generateIdTokenForCloudRun(sts.accessToken, audienceUrl);
-    if (!idt.ok) {
-      return NextResponse.json(
-        { ok: false, error: "generate_id_token_failed", details: idt },
-        { status: 500 }
-      );
-    }
-
-    // 3) Call Cloud Run
+    // 2) Llamar Cloud Run
     const r = await fetch(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${idt.idToken}`,
+        Authorization: `Bearer ${idToken}`,
         "x-admin-key": ADMIN_KEY,
       },
       body: JSON.stringify({
@@ -139,11 +91,21 @@ export async function POST(req) {
 
     const raw = await r.text();
     let data = null;
-    try { data = JSON.parse(raw); } catch { data = null; }
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = null;
+    }
 
     if (!r.ok || !data?.ok) {
       return NextResponse.json(
-        { ok: false, error: "cloud_run_error", status: r.status, statusText: r.statusText, raw },
+        {
+          ok: false,
+          error: "cloud_run_error",
+          status: r.status,
+          statusText: r.statusText,
+          raw,
+        },
         { status: 500 }
       );
     }
@@ -157,7 +119,13 @@ export async function POST(req) {
     });
   } catch (e) {
     return NextResponse.json(
-      { ok: false, error: "server_error", message: e?.message || "unknown" },
+      {
+        ok: false,
+        error: "server_error",
+        message: e?.message || "unknown",
+        // esto ayuda MUCHO a diagnosticar en Vercel logs
+        stack: e?.stack || "",
+      },
       { status: 500 }
     );
   }
