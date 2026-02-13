@@ -15,7 +15,7 @@ async function getGoogleAccessTokenFromVercelOIDC() {
   const poolId = mustEnv("GCP_WIF_POOL_ID");
   const providerId = mustEnv("GCP_WIF_PROVIDER_ID");
 
-  // Audience para STS (formato correcto)
+  // Audience STS (formato correcto)
   const audience = `//iam.googleapis.com/projects/${projectNumber}/locations/global/workloadIdentityPools/${poolId}/providers/${providerId}`;
 
   // Token OIDC emitido por Vercel
@@ -23,20 +23,21 @@ async function getGoogleAccessTokenFromVercelOIDC() {
 
   const stsUrl = "https://sts.googleapis.com/v1/token";
 
-  // ✅ Usamos JSON (consistente) y subjectTokenType = id_token
-  const body = {
+  // ✅ IMPORTANTE: subject_token_type = jwt (así lo usa Google para WIF)
+  // y body x-www-form-urlencoded (lo más compatible)
+  const params = new URLSearchParams({
     audience,
-    grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
-    requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+    requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
     scope: "https://www.googleapis.com/auth/cloud-platform",
-    subjectTokenType: "urn:ietf:params:oauth:token-type:id_token",
-    subjectToken: vercelOidc,
-  };
+    subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+    subject_token: vercelOidc,
+  });
 
   const r = await fetch(stsUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
   });
 
   const data = await r.json().catch(() => null);
@@ -48,7 +49,7 @@ async function getGoogleAccessTokenFromVercelOIDC() {
   return { ok: true, accessToken: data.access_token };
 }
 
-// 2) access_token -> ID token del Service Account (para invocar Cloud Run privado)
+// 2) access_token -> ID Token del Service Account para invocar Cloud Run privado
 async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
   const serviceAccount = mustEnv("GCP_SERVICE_ACCOUNT");
 
@@ -79,8 +80,10 @@ async function generateIdTokenForCloudRun(accessToken, audienceUrl) {
 export async function POST(req) {
   try {
     const ADMIN_KEY = mustEnv("ADMIN_KEY");
-    const targetUrl = mustEnv("GCP_TARGET_URL"); // Cloud Run URL
-    const audience = mustEnv("GCP_AUDIENCE");    // normalmente igual a targetUrl
+
+    // Cloud Run target (createmppreference)
+    const targetUrl = mustEnv("GCP_TARGET_URL"); // ej: https://createmppreference-...run.app
+    const audienceUrl = mustEnv("GCP_AUDIENCE"); // normalmente IGUAL a targetUrl
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -89,6 +92,7 @@ export async function POST(req) {
 
     const name = String(body.name || "").trim();
     const email = String(body.email || "").trim().toLowerCase();
+
     const amount = 100000;
 
     if (!name) return NextResponse.json({ ok: false, error: "missing name" }, { status: 400 });
@@ -107,8 +111,8 @@ export async function POST(req) {
       );
     }
 
-    // 2) Generate ID token as the service account
-    const idt = await generateIdTokenForCloudRun(sts.accessToken, audience);
+    // 2) Generate ID token as Service Account
+    const idt = await generateIdTokenForCloudRun(sts.accessToken, audienceUrl);
     if (!idt.ok) {
       return NextResponse.json(
         { ok: false, error: "generate_id_token_failed", details: idt },
